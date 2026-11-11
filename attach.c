@@ -97,6 +97,33 @@ win_change()
 	win_changed = 1;
 }
 
+static int
+thorough_write(int fd, const void *buf, size_t count)
+{
+	size_t written = 0;
+
+	while (written < count)
+	{
+		ssize_t len = write(fd, (char*)buf + written, count - written);
+		if ((len < 0) && (errno == EINTR))
+            continue;
+		if (len <= 0)
+			return 0;
+		written += len;
+	}
+	return 1;
+}
+
+static void
+packet_write(int fd, struct packet *ppkt)
+{
+	if(! thorough_write(fd, ppkt, sizeof(struct packet)))
+	{
+		printf("%s: communications garbled: %s\n", progname, strerror(errno));
+		exit(1);
+	}
+}
+
 /* Handles input from the keyboard. */
 static void
 process_kbd(int s, struct packet *pkt)
@@ -106,7 +133,7 @@ process_kbd(int s, struct packet *pkt)
 	{
 		/* Tell the master that we are suspending. */
 		pkt->type = MSG_DETACH;
-		write(s, pkt, sizeof(struct packet));
+		packet_write(s, pkt);
 
 		/* And suspend... */
 		tcsetattr(0, TCSADRAIN, &orig_term);
@@ -116,27 +143,34 @@ process_kbd(int s, struct packet *pkt)
 
 		/* Tell the master that we are returning. */
 		pkt->type = MSG_ATTACH;
-		write(s, pkt, sizeof(struct packet));
+		packet_write(s, pkt);
 
 		/* We would like a redraw, too. */
 		pkt->type = MSG_REDRAW;
 		pkt->len = redraw_method;
 		ioctl(0, TIOCGWINSZ, &pkt->u.ws);
-		write(s, pkt, sizeof(struct packet));
+		packet_write(s, pkt);
 		return;
 	}
-	/* Detach char? */
-	else if (pkt->u.buf[0] == detach_char)
+	else
 	{
-		printf(EOS "\r\n[detached]\r\n");
-		exit(0);
+		int i;
+		for(i = 0; i < pkt->len; i++)
+		{
+			/* Detach char? */
+			if (pkt->u.buf[i] == detach_char)
+			{
+				printf(EOS "\r\n[detached]\r\n");
+				exit(0);
+			}
+			/* Just in case something pukes out. */
+			else if (pkt->u.buf[i] == CTRL_L)
+				win_changed = 1;
+		}
 	}
-	/* Just in case something pukes out. */
-	else if (pkt->u.buf[0] == '\f')
-		win_changed = 1;
 
 	/* Push it out */
-	write(s, pkt, sizeof(struct packet));
+	packet_write(s, pkt);
 }
 
 int
@@ -187,17 +221,17 @@ attach_main(int noerror)
 	tcsetattr(0, TCSADRAIN, &cur_term);
 
 	/* Clear the screen. This assumes VT100. */
-	write(1, "\33[H\33[J", 6);
+	thorough_write(1, "\33[H\33[J", 6);
 
 	/* Tell the master that we want to attach. */
 	pkt.type = MSG_ATTACH;
-	write(s, &pkt, sizeof(struct packet));
+	packet_write(s, &pkt);
 
 	/* We would like a redraw, too. */
 	pkt.type = MSG_REDRAW;
 	pkt.len = redraw_method;
 	ioctl(0, TIOCGWINSZ, &pkt.u.ws);
-	write(s, &pkt, sizeof(struct packet));
+	packet_write(s, &pkt);
 
 	/* Wait for things to happen */
 	while (1)
@@ -231,7 +265,7 @@ attach_main(int noerror)
 				exit(1);
 			}
 			/* Send the data to the terminal. */
-			write(1, buf, len);
+			thorough_write(1, buf, len);
 			n--;
 		}
 		/* stdin activity */
@@ -239,10 +273,12 @@ attach_main(int noerror)
 		{
 			pkt.type = MSG_PUSH;
 			memset(pkt.u.buf, 0, sizeof(pkt.u.buf));
-			pkt.len = read(0, pkt.u.buf, sizeof(pkt.u.buf));
+			int len = read(0, pkt.u.buf, sizeof(pkt.u.buf));
 
-			if (pkt.len <= 0)
+			if (len <= 0)
 				exit(1);
+
+			pkt.len = len;
 			process_kbd(s, &pkt);
 			n--;
 		}
@@ -254,7 +290,7 @@ attach_main(int noerror)
 
 			pkt.type = MSG_WINCH;
 			ioctl(0, TIOCGWINSZ, &pkt.u.ws);
-			write(s, &pkt, sizeof(pkt));
+			packet_write(s, &pkt);
 		}
 	}
 	return 0;

@@ -116,6 +116,11 @@ struct packet
 };
 
 /*
+** Length of backlog queue for listen()
+*/
+#define BACKLOG 128
+
+/*
 ** The master sends a simple stream of text to the attaching clients, without
 ** any protocol. This might change back to the packet based protocol in the
 ** future. In the meantime, however, we minimize the amount of data sent back
@@ -126,6 +131,9 @@ struct packet
 
 /* This hopefully moves to the bottom of the screen */
 #define EOS "\033[999H"
+
+/* Redraw character */
+#define CTRL_L '\f'
 
 int attach_main(int noerror);
 int master_main(char **argv, int waitattach);

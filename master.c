@@ -47,6 +47,12 @@ struct client
 	int fd;
 	/* Whether or not the client is attached. */
 	int attached;
+	/* Place to store packets coming from the client. */
+	struct packet pkt;
+	/* Amount of data received into the above buffer so far. */
+	int pkt_rcv;
+	/* Amount of data written to the program. */
+	int written;
 };
 
 /* The list of connected clients. */
@@ -195,7 +201,7 @@ create_socket(char *name)
 		close(s);
 		return -1;
 	}
-	if (listen(s, 128) < 0)
+	if (listen(s, BACKLOG) < 0)
 	{
 		close(s);
 		return -1;
@@ -242,60 +248,59 @@ pty_activity(int s)
 		exit(1);
 #endif
 
-top:
-	/*
-	** Wait until at least one client is writable. Also wait on the control
-	** socket in case a new client tries to connect.
-	*/
-	FD_ZERO(&readfds);
-	FD_ZERO(&writefds);
-	FD_SET(s, &readfds);
-	highest_fd = s;
 	for (p = clients, nclients = 0; p; p = p->next)
-	{
-		if (!p->attached)
-			continue;
-		FD_SET(p->fd, &writefds);
-		if (p->fd > highest_fd)
-			highest_fd = p->fd;
-		nclients++;
-	}
-	if (nclients == 0)
-		return;
-	if (select(highest_fd + 1, &readfds, &writefds, NULL, NULL) < 0)
-		return;
+		p->written = 0;
 
-	/* Send the data out to the clients. */
-	for (p = clients, nclients = 0; p; p = p->next)
-	{
-		int written;
-
-		if (!FD_ISSET(p->fd, &writefds))
-			continue;
-
-		written = 0;
-		while (written < len)
+	do {
+		/*
+			** Wait until at least one client is writable. Also wait on the control
+		** socket in case a new client tries to connect.
+		*/
+		FD_ZERO(&readfds);
+		FD_ZERO(&writefds);
+		FD_SET(s, &readfds);
+		highest_fd = s;
+		for (p = clients, nclients = 0; p; p = p->next)
 		{
-			int n = write(p->fd, buf + written, len - written);
-
-			if (n > 0)
-			{
-				written += n;
+			if (!p->attached)
 				continue;
-			}
-			else if (n < 0 && errno == EINTR)
-				continue;
-			else if (n < 0 && errno != EAGAIN)
-				nclients = -1;
-			break;
-		}
-		if (nclients != -1 && written == len)
+			FD_SET(p->fd, &writefds);
+			if (p->fd > highest_fd)
+				highest_fd = p->fd;
 			nclients++;
-	}
+		}
+		if (nclients == 0)
+			return;
+		if (select(highest_fd + 1, &readfds, &writefds, NULL, NULL) < 0)
+			return;
+
+		/* Send the data out to the clients. */
+		for (p = clients, nclients = 0; p; p = p->next)
+		{
+			if (!FD_ISSET(p->fd, &writefds))
+				continue;
+
+			while (p->written < len)
+			{
+				int n = write(p->fd, buf + p->written, len - p->written);
+
+				if (n > 0)
+				{
+					p->written += n;
+					continue;
+				}
+				else if (n < 0 && errno == EINTR)
+					continue;
+				else if (n < 0 && errno != EAGAIN)
+					nclients = -1;
+				break;
+			}
+			if (nclients != -1 && p->written == len)
+				nclients++;
+		}
 
 	/* Try again if nothing happened. */
-	if (!FD_ISSET(s, &readfds) && nclients == 0)
-		goto top;
+	} while(!FD_ISSET(s, &readfds) && nclients == 0);
 }
 
 /* Process activity on the control socket */
@@ -317,8 +322,13 @@ control_activity(int s)
 
 	/* Link it in. */
 	p = malloc(sizeof(struct client));
+	if(p == 0) {
+		close(fd);
+		return;
+	}
 	p->fd = fd;
 	p->attached = 0;
+	p->pkt_rcv = 0;
 	p->pprev = &clients;
 	p->next = *(p->pprev);
 	if (p->next)
@@ -331,10 +341,10 @@ static void
 client_activity(struct client *p)
 {
 	int len;
-	struct packet pkt;
+	char *ppkt = (char*) &p->pkt + p->pkt_rcv;
 
 	/* Read the activity. */
-	len = read(p->fd, &pkt, sizeof(struct packet));
+	len = read(p->fd, ppkt, sizeof(struct packet) - p->pkt_rcv);
 	if (len < 0 && (errno == EAGAIN || errno == EINTR))
 		return;
 
@@ -349,27 +359,38 @@ client_activity(struct client *p)
 		return;
 	} 
 
+	p->pkt_rcv += len;
+	if (p->pkt_rcv < (int)sizeof(struct packet))
+		return;
+	p->pkt_rcv = 0;
+
 	/* Push out data to the program. */
-	if (pkt.type == MSG_PUSH)
-		write(the_pty.fd, pkt.u.buf, pkt.len);
+	if (p->pkt.type == MSG_PUSH) {
+		int written;
+		for (written = 0; written < p->pkt.len; written += len) {
+			len = write(the_pty.fd, p->pkt.u.buf, p->pkt.len);
+			if(len <= 0)
+				exit(1);
+		}
+	}
 
 	/* Attach or detach from the program. */
-	else if (pkt.type == MSG_ATTACH)
+	else if (p->pkt.type == MSG_ATTACH)
 		p->attached = 1;
-	else if (pkt.type == MSG_DETACH)
+	else if (p->pkt.type == MSG_DETACH)
 		p->attached = 0;
 
 	/* Window size change request, without a forced redraw. */
-	else if (pkt.type == MSG_WINCH)
+	else if (p->pkt.type == MSG_WINCH)
 	{
-		the_pty.ws = pkt.u.ws;
+		the_pty.ws = p->pkt.u.ws;
 		ioctl(the_pty.fd, TIOCSWINSZ, &the_pty.ws);
 	}
 
 	/* Force a redraw using a particular method. */
-	else if (pkt.type == MSG_REDRAW)
+	else if (p->pkt.type == MSG_REDRAW)
 	{
-		int method = pkt.len;
+		int method = p->pkt.len;
 
 		/* If the client didn't specify a particular method, use
 		** whatever we had on startup. */
@@ -379,19 +400,19 @@ client_activity(struct client *p)
 			return;
 
 		/* Set the window size. */
-		the_pty.ws = pkt.u.ws;
+		the_pty.ws = p->pkt.u.ws;
 		ioctl(the_pty.fd, TIOCSWINSZ, &the_pty.ws);
 
 		/* Send a ^L character if the terminal is in no-echo and
 		** character-at-a-time mode. */
 		if (method == REDRAW_CTRL_L)
 		{
-			char c = '\f';
+			char c = CTRL_L;
 
-                	if (((the_pty.term.c_lflag & (ECHO|ICANON)) == 0) &&
-                        	(the_pty.term.c_cc[VMIN] == 1))
+			if (((the_pty.term.c_lflag & (ECHO|ICANON)) == 0) &&
+				(the_pty.term.c_cc[VMIN] == 1))
 			{
-				write(the_pty.fd, &c, 1);
+				write(the_pty.fd, &c, 1);	// don't bother too much if it doesn't come through
 			}
 		}
 		/* Send a WINCH signal to the program. */
@@ -566,12 +587,16 @@ master_main(char **argv, int waitattach)
 	{
 		char buf[1024];
 		int len;
+		int error = 0;
 
 		close(fd[1]);
-		len = read(fd[0], buf, sizeof(buf));
-		if (len > 0)
+		while ((len = read(fd[0], buf, sizeof(buf))) > 0)
 		{
+			error = 1;
 			write(2, buf, len);
+		}
+		if (error)
+		{
 			kill(pid, SIGTERM);
 			return 1;
 		}
