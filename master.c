@@ -85,7 +85,8 @@ die(int sig)
 #endif
 		return;
 	}
-	exit(1);
+	unlink_socket();
+	_exit(1);
 }
 
 /* Sets a file descriptor to non-blocking mode. */

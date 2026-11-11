@@ -34,6 +34,12 @@ static struct termios cur_term;
 /* 1 if the window size changed */
 static int win_changed;
 
+/* Write a string to stdout */
+static void
+put_out(const char* str) {
+	write(STDOUT_FILENO, str, strlen(str));
+}
+
 /* Restores the original terminal settings. */
 static void
 restore_term(void)
@@ -41,8 +47,7 @@ restore_term(void)
 	tcsetattr(0, TCSADRAIN, &orig_term);
 
 	/* Make cursor visible. Assumes VT100. */
-	printf("\033[?25h");
-	fflush(stdout);
+	put_out("\033[?25h");
 }
 
 /* Connects to a unix domain socket */
@@ -82,11 +87,15 @@ static RETSIGTYPE
 die(int sig)
 {
 	/* Print a nice pretty message for some things. */
-	if (sig == SIGHUP || sig == SIGINT)
-		printf(EOS "\r\n[detached]\r\n");
-	else
-		printf(EOS "\r\n[got signal %d - dying]\r\n", sig);
-	exit(1);
+	switch (sig) {
+ 	case SIGHUP:  // nobreak
+	case SIGINT:  put_out(EOS "\r\n[detached]\r\n");            break;
+	case SIGTERM: put_out(EOS "\r\n[got SIGTERM - dying]\r\n"); break;
+	case SIGQUIT: put_out(EOS "\r\n[got SIGQUIT - dying]\r\n"); break;
+	default:      put_out(EOS "\r\n[got signal - dying]\r\n");  break;
+	}
+	restore_term();
+	_exit(1);
 }
 
 /* Window size change. */
